@@ -1,6 +1,6 @@
 use appcui::graphics::{CharAttribute, CharFlags, Character, Color};
 
-use super::AnsiParserBuilder;
+use super::{AnsiErrorKind, AnsiParserBuilder, OnError};
 
 fn parse(text: &str) -> Vec<Character> {
     let mut output = Vec::new();
@@ -210,6 +210,7 @@ fn reset_returns_to_the_parser_default_attribute() {
         .build();
     let mut output = Vec::new();
     parser.write_into_vec("A\x1b[31mB\x1b[0mC\x1b[39;49mD", &mut output);
+    assert!(parser.errors().is_empty());
     assert_eq!(
         output,
         vec![
@@ -219,4 +220,72 @@ fn reset_returns_to_the_parser_default_attribute() {
             character('D', Color::Green, Color::DarkBlue, CharFlags::Italic),
         ]
     );
+}
+
+#[test]
+fn ignore_drops_malformed_sequences_without_recording_them() {
+    let mut parser = AnsiParserBuilder::new().build();
+    let mut output = Vec::new();
+    parser.write_into_vec("A\x1b[31€B", &mut output);
+    assert!(parser.errors().is_empty());
+    assert_eq!(codes_of(&output), vec!['A', '€', 'B']);
+}
+
+#[test]
+fn collect_records_malformed_sequences_and_continues() {
+    let mut parser = AnsiParserBuilder::new().on_error(OnError::Collect).build();
+    let mut output = Vec::new();
+    let text = "\x1b[31€\x1b[32mZ\x1b";
+    parser.write_into_vec(text, &mut output);
+    assert_eq!(codes_of(&output), vec!['€', 'Z']);
+    assert_eq!(output[1].foreground, Color::DarkGreen);
+    assert_eq!(
+        parser.errors(),
+        &[
+            AnsiErrorKind::InvalidCsi('€').at(0),
+            AnsiErrorKind::TruncatedEscape.at(text.rfind('\u{1b}').unwrap()),
+        ]
+    );
+}
+
+#[test]
+fn collect_reports_a_truncated_string_and_ignores_finished_commands() {
+    let mut parser = AnsiParserBuilder::new().on_error(OnError::Collect).build();
+    let mut output = Vec::new();
+    let text = "\x1b[2J\x1b]0;title\x07X\x1b]unterminated";
+    parser.write_into_vec(text, &mut output);
+    assert_eq!(codes_of(&output), vec!['X']);
+    let truncated_at = text.find('X').unwrap() + 1;
+    assert_eq!(
+        parser.errors(),
+        &[AnsiErrorKind::TruncatedString.at(truncated_at)]
+    );
+}
+
+#[test]
+fn stop_keeps_characters_written_before_the_first_error() {
+    let mut parser = AnsiParserBuilder::new().on_error(OnError::Stop).build();
+    let mut output = Vec::new();
+    parser.write_into_vec("AB\x1b[31€CD", &mut output);
+    assert_eq!(codes_of(&output), vec!['A', 'B']);
+    assert_eq!(parser.errors(), &[AnsiErrorKind::InvalidCsi('€').at(2)]);
+}
+
+#[test]
+fn the_next_write_clears_previous_errors() {
+    let mut parser = AnsiParserBuilder::new().on_error(OnError::Collect).build();
+    parser.write_into_vec("\x1b", &mut Vec::new());
+    assert_eq!(parser.errors(), &[AnsiErrorKind::TruncatedEscape.at(0)]);
+    parser.write_into_vec("Hi", &mut Vec::new());
+    assert!(parser.errors().is_empty());
+}
+
+fn codes_of(chars: &[Character]) -> Vec<char> {
+    chars.iter().map(|ch| ch.code).collect()
+}
+
+impl AnsiErrorKind {
+    fn at(self, offset: usize) -> super::AnsiError {
+        super::AnsiError { offset, kind: self }
+    }
 }

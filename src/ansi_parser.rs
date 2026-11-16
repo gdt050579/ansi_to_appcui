@@ -1,10 +1,50 @@
-use appcui::graphics::*;
 use crate::attr_utils::{self, *};
+use appcui::graphics::*;
+
+/// What [`AnsiParser`] does with a malformed escape sequence.
+///
+/// Cursor movement, erase, titles, and SGR codes AppCUI cannot store are valid
+/// sequences that are skipped. They are not errors.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OnError {
+    /// Drop the sequence and continue. This is the default.
+    #[default]
+    Ignore,
+    /// Record the sequence in [`AnsiParser::errors`] and continue.
+    Collect,
+    /// Record the sequence and stop. Characters already written stay in the output.
+    Stop,
+}
+
+/// A malformed escape sequence found while parsing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnsiError {
+    /// Byte index in the string passed to [`AnsiParser::write_into_vec`].
+    pub offset: usize,
+    pub kind: AnsiErrorKind,
+}
+
+/// Why a sequence was malformed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnsiErrorKind {
+    /// `ESC` at the end of the input, or an `ESC` sequence with no final byte.
+    TruncatedEscape,
+    /// `ESC [` or CSI without a final byte.
+    TruncatedCsi,
+    /// OSC, DCS, PM, APC, or SOS without BEL or ST.
+    TruncatedString,
+    /// `ESC` followed by a byte that does not start a sequence.
+    InvalidEscape(char),
+    /// CSI ended by a byte that is not a parameter or a final byte.
+    InvalidCsi(char),
+}
 
 pub struct AnsiParser {
     pub(crate) default_attr: CharAttribute,
     current_attr: CharAttribute,
     reverse_flag: bool,
+    on_error: OnError,
+    errors: Vec<AnsiError>,
     sgr_values: Vec<u16>,
     /// `sgr_sub_starts[i]` is where parameter `i`'s colon-subparameters begin in `sgr_subs`.
     sgr_sub_starts: Vec<usize>,
@@ -24,32 +64,70 @@ impl AnsiParser {
     /// Every other escape sequence, including cursor movement, erase, and window titles,
     /// is discarded. It does not emit characters and does not change the current style.
     /// Characters already in `vec` stay in place.
+    ///
+    /// Malformed sequences follow the [`OnError`] chosen on the builder. [`OnError::Ignore`]
+    /// drops them. The others are available from [`Self::errors`] after this call.
     pub fn write_into_vec(&mut self, text: &str, vec: &mut Vec<Character>) {
         self.reset();
+        self.errors.clear();
         let mut rest = text;
         while let Some(ch) = rest.chars().next() {
+            let offset = text.len() - rest.len();
             let after = &rest[ch.len_utf8()..];
-            match ch {
-                '\u{1b}' => rest = self.parse_escape_sequance(after),
-                '\u{9b}' => rest = self.parse_csi_sequance(after),
-                '\u{9d}' => rest = self.skip_string(after, true),
-                '\u{90}' | '\u{98}' | '\u{9e}' | '\u{9f}' => rest = self.skip_string(after, false),
+            let next = match ch {
+                '\u{1b}' => self.parse_escape_sequance(after, offset),
+                '\u{9b}' => self.parse_csi_sequance(after, offset),
+                '\u{9d}' => self.skip_string(after, offset, true),
+                '\u{90}' | '\u{98}' | '\u{9e}' | '\u{9f}' => self.skip_string(after, offset, false),
                 '\t' | '\n' | '\r' => {
                     self.push_char(vec, ch);
-                    rest = after;
+                    Some(after)
                 }
-                other if other.is_control() => rest = after,
+                other if other.is_control() => Some(after),
                 other => {
                     self.push_char(vec, other);
-                    rest = after;
+                    Some(after)
                 }
+            };
+            match next {
+                Some(tail) => rest = tail,
+                None => return,
             }
         }
+    }
+
+    /// Malformed sequences from the last [`Self::write_into_vec`] call.
+    pub fn errors(&self) -> &[AnsiError] {
+        &self.errors
     }
 
     fn reset(&mut self) {
         self.current_attr = self.default_attr;
         self.reverse_flag = false;
+    }
+
+    /// Records a malformed sequence. Returns whether parsing must stop.
+    fn report(&mut self, offset: usize, kind: AnsiErrorKind) -> bool {
+        match self.on_error {
+            OnError::Ignore => false,
+            OnError::Collect => {
+                self.errors.push(AnsiError { offset, kind });
+                false
+            }
+            OnError::Stop => {
+                self.errors.clear();
+                self.errors.push(AnsiError { offset, kind });
+                true
+            }
+        }
+    }
+
+    fn finish<'a>(&mut self, offset: usize, kind: AnsiErrorKind, tail: &'a str) -> Option<&'a str> {
+        if self.report(offset, kind) {
+            None
+        } else {
+            Some(tail)
+        }
     }
 
     fn push_char(&self, vec: &mut Vec<Character>, code: char) {
@@ -66,22 +144,22 @@ impl AnsiParser {
         ));
     }
 
-    fn parse_escape_sequance<'a>(&mut self, input: &'a str) -> &'a str {
+    fn parse_escape_sequance<'a>(&mut self, input: &'a str, offset: usize) -> Option<&'a str> {
         let mut chars = input.chars();
         let Some(next) = chars.next() else {
-            return "";
+            return self.finish(offset, AnsiErrorKind::TruncatedEscape, "");
         };
         match next {
-            '[' => self.parse_csi_sequance(chars.as_str()),
-            ']' => self.skip_string(chars.as_str(), true),
-            'P' | 'X' | '^' | '_' => self.skip_string(chars.as_str(), false),
-            '\u{20}'..='\u{2f}' => self.skip_esc_final(chars.as_str()),
-            '\u{30}'..='\u{7e}' => chars.as_str(),
-            _ => input,
+            '[' => self.parse_csi_sequance(chars.as_str(), offset),
+            ']' => self.skip_string(chars.as_str(), offset, true),
+            'P' | 'X' | '^' | '_' => self.skip_string(chars.as_str(), offset, false),
+            '\u{20}'..='\u{2f}' => self.skip_esc_final(chars.as_str(), offset),
+            '\u{30}'..='\u{7e}' => Some(chars.as_str()),
+            _ => self.finish(offset, AnsiErrorKind::InvalidEscape(next), input),
         }
     }
 
-    fn skip_esc_final<'a>(&self, input: &'a str) -> &'a str {
+    fn skip_esc_final<'a>(&mut self, input: &'a str, offset: usize) -> Option<&'a str> {
         let mut rest = input;
         while let Some(ch) = rest.chars().next() {
             if ('\u{20}'..='\u{2f}').contains(&ch) {
@@ -89,32 +167,37 @@ impl AnsiParser {
                 continue;
             }
             if ('\u{30}'..='\u{7e}').contains(&ch) {
-                return &rest[ch.len_utf8()..];
+                return Some(&rest[ch.len_utf8()..]);
             }
-            return rest;
+            return self.finish(offset, AnsiErrorKind::InvalidEscape(ch), rest);
         }
-        ""
+        self.finish(offset, AnsiErrorKind::TruncatedEscape, "")
     }
 
-    fn skip_string<'a>(&self, input: &'a str, allow_bel: bool) -> &'a str {
+    fn skip_string<'a>(
+        &mut self,
+        input: &'a str,
+        offset: usize,
+        allow_bel: bool,
+    ) -> Option<&'a str> {
         let mut rest = input;
         while let Some(ch) = rest.chars().next() {
             let after = &rest[ch.len_utf8()..];
             if (allow_bel && ch == '\u{7}') || ch == '\u{18}' || ch == '\u{1a}' {
-                return after;
+                return Some(after);
             }
             if ch == '\u{1b}' {
                 if let Some(stripped) = after.strip_prefix('\\') {
-                    return stripped;
+                    return Some(stripped);
                 }
-                return rest;
+                return Some(rest);
             }
             rest = after;
         }
-        ""
+        self.finish(offset, AnsiErrorKind::TruncatedString, "")
     }
 
-    fn parse_csi_sequance<'a>(&mut self, input: &'a str) -> &'a str {
+    fn parse_csi_sequance<'a>(&mut self, input: &'a str, offset: usize) -> Option<&'a str> {
         self.sgr_values.clear();
         self.sgr_sub_starts.clear();
         self.sgr_subs.clear();
@@ -128,7 +211,7 @@ impl AnsiParser {
 
         loop {
             let Some(ch) = rest.chars().next() else {
-                return "";
+                return self.finish(offset, AnsiErrorKind::TruncatedCsi, "");
             };
             let after = &rest[ch.len_utf8()..];
             match ch {
@@ -175,9 +258,9 @@ impl AnsiParser {
                     if ch == 'm' && !private && !intermediate {
                         self.apply_sgr();
                     }
-                    return after;
+                    return Some(after);
                 }
-                _ => return rest,
+                _ => return self.finish(offset, AnsiErrorKind::InvalidCsi(ch), rest),
             }
         }
     }
@@ -273,7 +356,9 @@ impl AnsiParser {
             2 => {
                 if params.len() >= 5 {
                     (
-                        Some(attr_utils::color_from_u16_rgb(params[2], params[3], params[4])),
+                        Some(attr_utils::color_from_u16_rgb(
+                            params[2], params[3], params[4],
+                        )),
                         5,
                     )
                 } else {
@@ -297,11 +382,17 @@ impl AnsiParserBuilder {
                 default_attr,
                 current_attr: default_attr,
                 reverse_flag: false,
+                on_error: OnError::Ignore,
+                errors: Vec::new(),
                 sgr_values: Vec::new(),
                 sgr_sub_starts: Vec::new(),
                 sgr_subs: Vec::new(),
             },
         }
+    }
+    pub fn on_error(mut self, on_error: OnError) -> Self {
+        self.parser.on_error = on_error;
+        self
     }
     pub fn default_attr(mut self, default_attr: CharAttribute) -> Self {
         self.parser.default_attr = default_attr;
